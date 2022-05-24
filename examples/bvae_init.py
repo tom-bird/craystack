@@ -1,5 +1,7 @@
 import sys
 import torch
+from torch import nn, optim
+from torch.nn import functional as F
 import numpy as np
 from autograd.builtins import tuple as ag_tuple
 import craystack as cs
@@ -10,14 +12,27 @@ from torchvision import datasets
 import craystack.bb_ans as bb_ans
 import time
 
+from craystack.util import spike_slab_pdf
+
+
+
+"""
+TODO:
+* spike and slab prior on forward model parameter delta and learn z + fwd model parameters
+* above but only learn forward model parameters with z taken to be max a priori (not communicated)
+* what is the difference between learning the gen_net parameters and learning the bernoulli parameters directly?
+    I guess we could only communicate a few bernoulli parameters - seems hacky
+"""
+
 rng = np.random.RandomState(0)
 
-prior_precision = 10
+prior_precision = 0
 bernoulli_precision = 16
 q_precision = 14
 
-zero_latents = False
-do_map = True
+zero_latents = True
+do_map = False
+do_adapt = True
 
 num_images = 10000
 num_pixels = num_images * 784
@@ -71,7 +86,7 @@ if do_map:
     map_z.requires_grad_()
     steps = 1000
     lr = 1e-3
-    optimizer = torch.optim.Adam([map_z], lr=lr)
+    optimizer = optim.Adam([map_z], lr=lr)
     init_images_torch = torch.from_numpy(init_images.astype(np.float32))
 
 
@@ -94,6 +109,52 @@ if do_map:
     map_z = map_z.detach().numpy()
 
 
+# optimise gen_net and communicate diff
+if do_adapt:
+    class FwdModel(nn.Module):
+        def __init__(self, hidden_dim=100):
+            super().__init__()
+            self.sigmoid = nn.Sigmoid()
+
+            self.fc3 = nn.Linear(latent_dim, hidden_dim)
+            self.fc4 = nn.Linear(hidden_dim, 784)
+
+        def forward(self, x):
+            h3 = F.relu(self.fc3(z))
+            return self.sigmoid(self.fc4(h3))
+
+    fwd_model = FwdModel()
+    with torch.no_grad():
+        fwd_model.fc3.weight = model.fc3.weight
+        fwd_model.fc3.bias = model.fc3.bias
+        fwd_model.fc4.weight = model.fc4.weight
+        fwd_model.fc4.bias = model.fc4.bias
+
+    steps = 1000
+    lr = 1e-3
+    optimizer = optim.Adam([map_z], lr=lr)
+    init_images_torch = torch.from_numpy(init_images.astype(np.float32))
+
+    sigma = 0.1
+
+    map_z = torch.zeros(latent_shape)  # zero is the max a priori for unit gaussian prior
+
+    init_fwd_params = model.fc3.parameters() + model.fc4.parameters()
+
+    def get_fwd_params(m):
+        return []
+
+    def neg_log_joint():
+        fwd_params = get_fwd_params(model)
+        delta = fwd_params - init_fwd_params
+        p_delta = Normal(0., sigma).log_prob(delta)  # TODO: normal for now
+
+        x_probs = model.decode(z)
+        dist = Bernoulli(x_probs)
+        l = torch.sum(dist.log_prob(init_images_torch), dim=1)
+
+        return p_delta  # to check grads working
+        # return -torch.mean(l + p_delta) * np.log2(np.e) / 784.  # in bits per dim
 # set up codec
 init_append, init_pop = bb_ans.VAE_init_1d(gen_net, rec_net, obs_codec, prior_precision, latent_shape,
                                            zero_latents, map_z)
